@@ -49,7 +49,7 @@ scatter_plot <- ggplot(radiocarbones, aes(x = Long, y = Lat)) +
   geom_point()
 
 # General SPD parameters
-nsim <- 1000 #Set 5 for testing 
+nsim <- 1000 #Set 5 for demo
 ncores <- 6
 runm <- 50
 binh <- 50

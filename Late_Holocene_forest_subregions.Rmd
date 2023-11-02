@@ -1,0 +1,696 @@
+---
+title: "test"
+output: html_document
+date: "2023-09-30"
+---
+
+```{r}
+library(tidyverse)
+library(doParallel)
+library(rcarbon)
+library(p3k14c)
+library(sf)
+library(patchwork)
+```
+
+
+Theme for the plots
+```{r}
+my_theme <- theme(
+    panel.border = element_rect(fill = "transparent", colour = "black"),
+    panel.background = element_rect(fill = "transparent", colour = "transparent"),
+    axis.text.y = element_text(size = 8),
+    axis.title.y = element_text(size = 8)) 
+```
+
+
+Loading Rasters for mapping
+```{r}
+land_polyg <- sf::st_read("Raster/land_polyg_subregions.shp")
+```
+
+## -------------- SPD CURVE -------------------------------
+
+```{r}
+# General SPD parameters
+nsim <- 1000 # set to 5 for demo
+ncores <- 6 # multi-core processing (set higher if available)
+runm <- 50 # smoothing of SPDs
+binh <- 50 # bin clustering
+realstartBP <- 10000
+realendBP <- 2000
+bracket <- 1000
+workingstartBP <- realstartBP + bracket
+workingendBP <- realendBP - bracket
+if (workingendBP < 0) { workingendBP <- 0 }
+
+# Define the region column based on your criteria
+radiocarbones0 <- p3k14c::p3k14c_data %>%
+  filter(Age <= 10000) %>%
+  mutate(region = case_when(
+    between(Long, 35, 38) & between(Lat, 34.5, 36.6) ~ "Levant",
+    between(Long, 35, 38) & between(Lat, 30, 34.5) ~ "Levant",
+    between(Long, 30, 35) & between(Lat, 30, 32) ~ "Levant",
+    between(Long, 26, 40) & between(Lat, 36.6, 41.5) ~ "Anatolia",
+    between(Long, 40, 42) & between(Lat, 37.5, 41.5) ~ "Anatolia",
+    between(Long, 20, 25.5) & between(Lat, 36, 41.5) ~ "Greece",
+    TRUE ~ "other"
+  )) %>%
+  filter(region != "other")
+
+
+# Define a function to create region-specific plots
+create_region_plot <- function(data, region_name, land_polyg, ncores, runm, binh) {
+  # Filter data for the specified region
+  radiocarbones <- data %>%
+    filter(region == region_name)
+  
+  # Calibrate radiocarbon dates
+  alldates_my1 <- calibrate(
+    x = radiocarbones$Age, errors = radiocarbones$Error,
+    calCurves = 'intcal20', method = "standard", normalised = FALSE,
+    ncores = ncores, calMatrix = TRUE
+  )
+  
+  # Prepare bins
+  bins_my1 <- binPrep(
+    sites = radiocarbones$SiteName, ages = radiocarbones$Age, h = binh
+  )
+  
+  # Calculate SPD
+  allspd_my1 <- spd(
+    x = alldates_my1, bins = bins_my1,
+    timeRange = c(workingstartBP, workingendBP), datenormalised = FALSE,
+    runm = runm
+  )
+  
+  # Fit logistic model and create predicted SPD with adjusted starting values
+spd.smoothed <- spd(
+  alldates_my1, timeRange = c(7250, 2000), bins = bins_my1,
+  runm = runm
+)
+
+# Adjusted starting values
+start_values <- list(
+  Asym = max(spd.smoothed$grid$PrDens), # Start with the maximum value
+  xmid = 3500, # Adjust as needed based on your data
+  scale = -100
+)
+
+logFit <- nls(
+  PrDens ~ SSlogis(calBP, Asym, xmid, scale),
+  data = spd.smoothed$grid, control = nls.control(maxiter = 500),
+  start = start_values
+)
+  
+  logFitDens <- data.frame(
+    calBP = spd.smoothed$grid$calBP,
+    PrDens = SSlogis(
+      input = spd.smoothed$grid$calBP,
+      Asym = coefficients(logFit)[1],
+      xmid = coefficients(logFit)[2],
+      scal = coefficients(logFit)[3]
+    )
+  )
+  
+  logisticmod <- modelTest(
+    alldates_my1, errors = radiocarbones$Error, bins = bins_my1,
+    nsim = nsim, timeRange = c(7250, 2000), model = "custom",
+    predgrid = logFitDens, runm = runm, raw = TRUE
+  )
+  
+  # Plot SPD
+  prueba <- as.data.frame(logisticmod["result"])
+  
+  plot <- prueba %>%
+    filter(result.calBP >= 2500 & result.calBP <= 6000) %>%
+    ggplot() +
+    geom_ribbon(aes(x = result.calBP, ymin = result.lo, ymax = result.hi), fill = "grey70") +
+    geom_line(aes(x = result.calBP, y = result.PrDens),colour="#fa3c4c") +
+    scale_x_continuous(breaks = seq(0, 6000, 500), labels = seq(0, 6, 0.5),expand=c(0,0)) +
+    scale_y_continuous(expand = c(0, 0), position = "right") +
+    expand_limits(x = c(0, 6000)) +
+   # annotate("text", x = 60, y = 0.45, label = "(b) SPD", size = 2, hjust=0) +
+    labs(x="Age (ky)", y= NULL) +
+    my_theme
+  
+  return(plot)
+}
+
+# Create plots for specific regions
+spd_levant <- create_region_plot(radiocarbones0, "Levant", land_polyg, ncores, runm, binh)
+spd_greece <- create_region_plot(radiocarbones0, "Greece", land_polyg, ncores, runm, binh)
+spd_anatolia <- create_region_plot(radiocarbones0, "Anatolia", land_polyg, ncores, runm, binh)
+
+spd_levant
+spd_greece
+spd_anatolia
+```
+
+
+
+```{r}
+# Create a list to store the plots
+saved_plots <- list(
+  levant = spd_levant,
+  greece = spd_greece,
+  anatolia = spd_anatolia
+)
+
+# Save the list of plots to a file
+saveRDS(saved_plots, file = "Ouput_figures/saved_plots.rds")
+```
+
+
+```{r}
+# Load the saved plots
+loaded_plots <- readRDS("Ouput_figures/saved_plots.rds")
+
+# Access and edit individual plots
+spd_levant <- loaded_plots$levant
+spd_greece <- loaded_plots$greece
+spd_anatolia <- loaded_plots$anatolia
+
+# View the edited plot
+spd_levant
+spd_greece
+spd_anatolia
+```
+
+
+
+
+
+# Vegetation
+
+```{r}
+pollen <- read.csv("Input/Pollen_data.csv") %>% filter(!marine_or_velgbasin %in% c("marine", "velg"))
+
+cutpoints <- read.csv("Input/Cutpoints_optimal_umbrales.csv") %>% select(biome, threshold) %>% distinct()
+
+observed_biome <- read.csv("Input/resolution1kmfrom250m_window21km_perside.csv") %>% select(ID_SAMPLE, Dominant, Subdominant)
+
+train <- read.csv("Input/BiomeData_EC4c_f.csv", header = TRUE, sep = ",")
+
+pollen_sampmeta <- pollen %>% select(entity_name, latitude, longitude, elevation, ID_SAMPLE, age) %>% distinct()
+
+
+# Define a function for region assignment
+assign_region <- function(df) {
+  df %>%
+    mutate(
+      region = case_when(
+        (longitude >= 35 & longitude <= 38 & latitude >= 34.5 & latitude < 36.6) |
+        (longitude >= 35 & longitude <= 38 & latitude >= 30 & latitude < 34.5) |
+        (longitude >= 30 & longitude <= 35 & latitude >= 30 & latitude < 32) ~ "Levant",
+        (longitude >= 26 & longitude <= 40 & latitude >= 36.6 & latitude <= 41.5) |
+        (longitude > 40 & longitude <= 42 & latitude >= 37.5 & latitude <= 41.5) ~ "Anatolia",
+        (longitude > 38 & longitude <= 40 & latitude > 36.5 & latitude <= 37.5) ~ "Anatolia3",
+        (longitude >= 20 & longitude <= 25.5 & latitude >= 36 & latitude <= 41.5) ~ "Greece",
+        TRUE ~ "other"
+      )
+    )
+}
+
+# Assign regions to pollen data
+pollen <- pollen %>%
+  assign_region()
+
+pollen_sampmeta <- pollen %>%
+  select(region, entity_name, latitude, longitude, elevation, ID_SAMPLE, age) %>%
+  distinct()
+
+# Create a table AllData
+alldata <- pollen %>%
+  full_join(train, by = "taxon_name") %>%
+  filter(!is.na(ID_SAMPLE)) %>%
+  filter(!is.na(Mean_CENF))
+
+# Dissimilarity index
+biomes0 <- alldata %>%
+  mutate(Epsilon = 0.5) %>%
+  mutate(
+    TUND_Sqrt = (taxon_percent - Mean_TUND)^2 / ((Stdev_TUND + Epsilon)^2),
+    DESE_Sqrt = (taxon_percent - Mean_DESE)^2 / ((Stdev_DESE + Epsilon)^2),
+    GRAM_Sqrt = (taxon_percent - Mean_GRAM)^2 / ((Stdev_GRAM + Epsilon)^2),
+    XSHB_Sqrt = (taxon_percent - Mean_XSHB)^2 / ((Stdev_XSHB + Epsilon)^2),
+    CENF_Sqrt = (taxon_percent - Mean_CENF)^2 / ((Stdev_CENF + Epsilon)^2),
+    TEDE_Sqrt = (taxon_percent - Mean_TEDE)^2 / ((Stdev_TEDE + Epsilon)^2),
+    CMIX_Sqrt = (taxon_percent - Mean_CMIX)^2 / ((Stdev_CMIX + Epsilon)^2),
+    ENWD_Sqrt = (taxon_percent - Mean_ENWD)^2 / ((Stdev_ENWD + Epsilon)^2),
+    WTSFS_Sqrt = (taxon_percent - Mean_WTSFS)^2 / ((Stdev_WTSFS + Epsilon)^2)
+  ) %>%
+  select(ID_SAMPLE, TUND_Sqrt, DESE_Sqrt, GRAM_Sqrt, XSHB_Sqrt, CENF_Sqrt,
+         TEDE_Sqrt, CMIX_Sqrt, ENWD_Sqrt, WTSFS_Sqrt) %>%
+  group_by(ID_SAMPLE) %>%
+  summarise(across(c(TUND_Sqrt, DESE_Sqrt, GRAM_Sqrt, XSHB_Sqrt, CENF_Sqrt,
+                     TEDE_Sqrt, CMIX_Sqrt, ENWD_Sqrt, WTSFS_Sqrt), sum)) %>%
+  mutate(across(c(TUND_Sqrt, DESE_Sqrt, GRAM_Sqrt, XSHB_Sqrt, CENF_Sqrt,
+                  TEDE_Sqrt, CMIX_Sqrt, ENWD_Sqrt, WTSFS_Sqrt), sqrt)) %>%
+  ungroup()
+
+# Get reciprocal of the scores and perform normalization
+biomes <- biomes0 %>%
+  mutate(
+    TUND = exp(-TUND_Sqrt / 100),
+    DESE = exp(-DESE_Sqrt / 100),
+    GRAM = exp(-GRAM_Sqrt / 100),
+    XSHB = exp(-XSHB_Sqrt / 100),
+    ENWD = exp(-ENWD_Sqrt / 100),
+    WTSFS = exp(-WTSFS_Sqrt / 100),
+    CENF = exp(-CENF_Sqrt / 100),
+    CMIX = exp(-CMIX_Sqrt / 100),
+    TEDE = exp(-TEDE_Sqrt / 100)
+  ) %>%
+  select(ID_SAMPLE, TUND, DESE, GRAM, XSHB, ENWD,
+         WTSFS, CENF, CMIX, TEDE)
+
+# Check for ties
+biomes_ties <- biomes %>%
+  pivot_longer(cols = -ID_SAMPLE, names_to = "column_name", values_to = "value") %>%
+  group_by(ID_SAMPLE) %>%
+  filter(value == max(value)) %>%
+  summarise(
+    tied_columns = list(column_name),
+    num_ties = n(),
+    pred_score = max(value, na.rm = TRUE)  # Calculate the maximum value
+  ) %>%
+  ungroup()
+
+# Pollen prediction
+polenpred <- biomes %>%
+  pivot_longer(cols = TUND:TEDE, names_to = "pred_biome", values_to = "pred_score") %>%
+  group_by(ID_SAMPLE) %>%
+  arrange(ID_SAMPLE, desc(pred_score)) %>%
+  filter(!is.na(pred_score)) %>%
+  slice_max(pred_score, n = 1) %>%
+  ungroup() %>%
+  inner_join(cutpoints, by = c("pred_biome" = "biome")) %>%
+  mutate(pred_biome_noa = case_when(pred_score <= threshold ~ "NONA", TRUE ~ pred_biome)) %>%
+  inner_join(pollen_sampmeta, by = "ID_SAMPLE") %>%
+  select(region, entity_name, latitude, longitude, elevation, ID_SAMPLE, age, everything())
+
+# Convert to forest, wtfs, and other
+polenpred_arb <- polenpred %>%
+  mutate(
+    pred_biome_noa_arbol = case_when(
+      pred_biome_noa %in% c("TEDE", "CMIX", "CENF") ~ "FOREST",
+      pred_biome_noa == "WTSFS" ~ "WTFS",
+      pred_biome_noa %in% c("GRAM", "DESE", "XSHB", "ENWD", "TUND") ~ "OTHER",
+      TRUE ~ pred_biome_noa
+    )
+  )
+
+# Calculate resolution of sequences
+resolucion <- polenpred %>%
+  group_by(entity_name) %>%
+  mutate(
+    anterior = lag(age),
+    reso = age - anterior,
+    resolucion = mean(reso, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  select(resolucion) %>%
+  distinct() %>%
+  mutate(mean_resol = mean(resolucion, na.rm = TRUE))
+
+res_f <- 300
+res_f_half <- res_f / 2
+
+wind_polenpred_arbol <- data.frame()
+
+# Iterate over the resolution bins
+for (i in seq(res_f, 6000, res_f_half)) {
+  aux1 <- polenpred_arb %>%
+    filter(age >= (i - res_f) & age <= i) %>%
+    mutate(ventana = paste("v", i - res_f, ".", i, sep = ""), bincentre = i - res_f_half)
+
+  wind_polenpred_arbol <- bind_rows(wind_polenpred_arbol, aux1)
+}
+
+# Check for duplicates in wind_polenpred_arbol
+check0 <- wind_polenpred_arbol %>%
+  group_by(entity_name, bincentre, pred_biome_noa_arbol) %>%
+  mutate(sumbiomescores = sum(pred_score)) %>%
+  ungroup() %>%
+  select(-c(ID_SAMPLE, age, pred_biome, pred_score, threshold, pred_biome_noa)) %>%
+  distinct() %>%
+  group_by(entity_name, bincentre) %>%
+  summarize(
+    has_duplicates = n_distinct(sumbiomescores) < n(),
+    num_bincentre_repeats = n()
+  )
+
+# Plot all entities
+polen_wind_arbol <- wind_polenpred_arbol %>%
+  group_by(entity_name, bincentre, pred_biome_noa_arbol) %>%
+  mutate(sumbiomescores = sum(pred_score)) %>%
+  ungroup() %>%
+  select(-c(ID_SAMPLE, age, pred_biome, pred_score, threshold, pred_biome_noa)) %>%
+  distinct() %>%
+  group_by(entity_name, bincentre) %>%
+  slice_max(sumbiomescores, with_ties = FALSE) %>%
+  ungroup() %>%
+  group_by(region, bincentre) %>%
+  add_count(name = "ent_per_bincentre") %>%
+  ungroup() %>%
+  group_by(region, bincentre, pred_biome_noa_arbol) %>%
+  add_count(name = "biom_sites") %>%
+  ungroup() %>%
+  mutate(propbiom = (biom_sites / ent_per_bincentre) * 100) %>%
+  select(region, bincentre, pred_biome_noa_arbol, ent_per_bincentre, biom_sites, propbiom) %>%
+  distinct()
+
+result <- polen_wind_arbol %>%
+  group_by(region, pred_biome_noa_arbol) %>%
+  mutate(
+    forest.se = (sd(propbiom) / sqrt(n())) * 1.96
+  ) %>%
+  ungroup() %>%
+  select(region, bincentre, pred_biome_noa_arbol, biom_sites, propbiom, forest.se) %>%
+  distinct()
+
+# Define target regions
+target_regions <- c("Anatolia", "Greece", "Levant")
+
+# Initialize an empty list to store the results
+result_list <- list()
+
+# Iterate over the target regions
+for (i in target_regions) {
+  aux1 <- polen_wind_arbol %>%
+    filter(region == i) %>%
+    select(region, bincentre, ent_per_bincentre) %>%
+    distinct()
+
+  aux2 <- result %>%
+    filter(pred_biome_noa_arbol == "FOREST") %>%
+    filter(region == i)
+
+  aux3 <- full_join(aux1, aux2, by = c("region", "bincentre")) %>%
+    mutate(propbiom = coalesce(propbiom, 0),
+           forest.se = coalesce(forest.se, 0))
+
+  # Store the result in the list
+  result_list[[i]] <- aux3
+}
+
+# Bind the results together into a single data frame
+final_output <- do.call(bind_rows, result_list)
+
+# Plotting functions for each region
+forest_anatolia <- final_output %>%
+  filter(region == "Anatolia") %>%
+  ggplot(aes(x = bincentre)) +
+  pammtools::geom_stepribbon(aes(ymin = propbiom - forest.se, ymax = propbiom + forest.se), fill = "grey70") +
+  geom_step(aes(y = propbiom)) +
+  scale_x_continuous(breaks = seq(0, 6000, 500), labels = seq(0, 6, 0.5),expand=c(0,0)) +
+  scale_y_continuous(breaks = seq(0, 80, by = 20), expand = c(0, 0),position = "right") +
+  expand_limits(x = c(0, 6000)) +
+  # annotate("text", x = 60, y = 0.45, label = "(b) SPD", size = 2, hjust=0) +
+  labs(x="Age (ky)", y= "Sites (%)") +
+  my_theme
+
+forest_greece <- final_output %>%
+  filter(region == "Greece") %>%
+  ggplot(aes(x = bincentre)) +
+  pammtools::geom_stepribbon(aes(ymin = propbiom - forest.se, ymax = propbiom + forest.se), fill = "grey70") +
+  geom_step(aes(y = propbiom)) +
+  scale_x_continuous(breaks = seq(0, 6000, 500), labels = seq(0, 6, 0.5),expand=c(0,0)) +
+  scale_y_continuous(breaks = seq(40, 80, by = 10), expand = c(0, 0),position = "right") +
+  expand_limits(x = c(0, 6000),y=c(40,80)) +
+  # annotate("text", x = 60, y = 0.45, label = "(b) SPD", size = 2, hjust=0) +
+  labs(x="Age (ky)", y= "Sites (%)") +
+  my_theme
+  
+
+forest_levant <- final_output %>%
+  filter(region == "Levant") %>%
+  ggplot(aes(x = bincentre)) +
+  pammtools::geom_stepribbon(aes(ymin = propbiom - forest.se, ymax = propbiom + forest.se), fill = "grey70") +
+  geom_step(aes(y = propbiom)) +
+  scale_x_continuous(breaks = seq(0, 6000, 500), labels = seq(0, 6, 0.5),expand=c(0,0)) +
+  scale_y_continuous(breaks = seq(0, 55, by = 15), expand = c(0, 0),position = "right") +
+  expand_limits(x = c(0, 6000),y=c(0,55)) +
+  # annotate("text", x = 60, y = 0.45, label = "(b) SPD", size = 2, hjust=0) +
+  labs(x="Age (ky)", y= "Sites (%)") +
+  my_theme
+
+
+# Save plots
+#ggsave(plot = plot_step_anatolia, filename = "Ouput_figures/Subregions/Levant_forest_step_full.pdf", units = "cm", height = 5.2, width = 9.2)
+#ggsave(plot = plot_step_greece, filename = "Ouput_figures/Subregions/Greece_forest_step_full.pdf", units = "cm", height = 5.2, width = 9.2)
+#ggsave(plot = plot_step_levant, filename = "Ouput_figures/Subregions/Anatolia_forest_step_full.pdf", units = "cm", height = 5.2, width = 9.2)
+
+# Display plots
+forest_anatolia
+forest_greece
+forest_levant
+```
+
+
+
+# Climate 
+
+```{r}
+
+kokain <- read.csv("Input/lake_isotopes/kocain2021iso.csv") %>%
+  mutate(
+    entity_name = "Kocain",
+    site_name = "Kocain",
+    site_id = 1000,
+    age = 1950 - age_AD,
+    latitude = 37.2325,
+    longitude = 30.71167,
+    sample_id = row_number()
+  ) %>%
+  rename(d18O_measurement = d18O) %>%
+  select(-c(age_AD, depth_mm, d13C))
+
+DBI::dbConnect(RMySQL::MySQL(),user = "root", 
+                 password='11.Opuntia', 
+                 host='localhost',
+                 dbname='sisal_v2')->sisal
+
+sisal |>
+DBI::dbGetQuery("SELECT site_id, site_name, latitude, longitude, entity_name, entity_id, sample_id, depth_sample, Bchron_age, interp_age, d18O_measurement, d13C_measurement
+FROM site JOIN entity USING (site_id) JOIN sample USING (entity_id) 
+JOIN sisal_chronology USING (sample_id) JOIN original_chronology USING(sample_id) JOIN d18o USING (sample_id) JOIN d13c USING (sample_id)  WHERE (latitude BETWEEN 30 AND 42.5) AND (longitude BETWEEN 20 AND 45);") |>
+  mutate(age=case_when(is.na(Bchron_age) ~ interp_age, TRUE ~ Bchron_age)) |>
+ # mutate(age=coalesce(age,interp_age)) |>
+ # filter(!is.na(age)) |>
+  filter(age <= 6000) |>
+  select(-c("Bchron_age", "interp_age")) -> data1
+
+
+sisal |>
+DBI::dbGetQuery("SELECT site_id, site_name, latitude, longitude, entity_name, entity_id, sample_id, depth_sample, interp_age, d18O_measurement, d13C_measurement
+FROM site JOIN entity USING (site_id) JOIN sample USING (entity_id) JOIN original_chronology USING(sample_id) JOIN d18o USING (sample_id) JOIN d13c USING (sample_id) WHERE entity_id in (690);") |>
+  mutate(age=interp_age) |>
+ # mutate(age=coalesce(age,interp_age)) |>
+ # filter(!is.na(age)) |>
+  filter(age <= 6000) |>
+  select(-c("interp_age")) -> soreq
+
+bind_rows(data1,soreq,kokain) -> Raw_Data
+
+#DBI::dbDisconnect(sisal)
+#rm(sisal)
+
+Raw_Data <- Raw_Data |>
+  mutate(d18O_measurement = case_when(site_name=="Sofular cave" ~ d13C_measurement,TRUE ~ d18O_measurement),
+         site_name = case_when(entity_name=="Jeita-1" ~ "Jeita-1", TRUE ~ site_name))
+
+plot_speleo <- function(data, y_col, y_label) {
+  data %>%
+    filter(site_name == site_name_value) %>%
+    ggplot(aes(x = age, y = {{y_col}})) +
+    geom_step(colour = "#0084ff") +
+    labs(x = NULL, y = y_label) +
+    annotate("text", x = 60, y = y_text, label = label, size = 2, hjust = 0) +
+    expand_limits(x = c(0, 6000)) +
+    scale_x_continuous(breaks = seq(0, 6000, 500), expand = c(0, 0),labels = seq(0,6,0.5)) +
+    scale_y_continuous(expand = c(0,0))+
+    scale_y_reverse(position = posit)+
+    labs(x="Age (ky)") +
+    my_theme 
+}
+
+
+site_name_value <- "Jeita-1"
+label <- "Jeita"
+y_text <- -5.9
+posit <- "left"
+plot_jeita <- plot_speleo(Raw_Data, d18O_measurement, expression(delta^18*O~"(‰VPDB)"))
+
+site_name_value <- "Sofular cave"
+label <- "Sofular"
+y_text <- -11.4
+posit <- "left"
+plot_sofular <- plot_speleo(Raw_Data, d13C_measurement, expression(delta^13*C~"(‰VPDB)"))
+
+site_name_value <- "Skala Marion cave"
+label <- "Skala Marion"
+y_text <- -6.6
+posit <- "right"
+plot_skala <- plot_speleo(Raw_Data, d18O_measurement, expression(delta^18*O~"(‰VPDB)"))
+
+site_name_value <- "Mavri Trypa cave"
+label <- "Mavri Trypa"
+y_text <- -6
+posit <- "left"
+plot_mavri <- plot_speleo(Raw_Data, d18O_measurement, expression(delta^18*O~"(‰VPDB)"))
+
+site_name_value <- "Kocain"
+label <- "Kocain"
+y_text <- -4.3
+posit <- "right"
+plot_kokain <- plot_speleo(Raw_Data, d18O_measurement, expression(delta^18*O~"(‰VPDB)"))
+
+plot_jeita
+plot_sofular
+plot_skala
+plot_mavri
+plot_kokain
+```
+
+
+
+```{r}
+spd_levant1 <- spd_levant + theme(axis.text.y = element_blank(),
+                            axis.text.x = element_blank(),
+                            axis.ticks.y = element_blank(),
+                            axis.title = element_blank())
+
+spd_anatolia1 <- spd_anatolia + theme(axis.text.y = element_blank(),
+                            axis.text.x = element_blank(),
+                            axis.ticks.y = element_blank(),
+                            axis.title = element_blank())
+
+spd_greece1 <- spd_greece + theme(axis.text.y = element_blank(),
+                            axis.text.x = element_blank(),
+                            axis.ticks.y = element_blank(),
+                            axis.title = element_blank())
+
+forest_levant1 <- forest_levant + theme(axis.text.x = element_blank(),
+                                        axis.title.y = element_blank(),
+                                       axis.title.x = element_blank())
+
+forest_anatolia1 <- forest_anatolia + theme(axis.text.x = element_blank(),
+                                            axis.title.x = element_blank(),
+                                            axis.title.y = element_blank())
+
+forest_greece1 <- forest_greece + theme(axis.text.x = element_blank(),
+                                       axis.title.x = element_blank(),
+                                       axis.title.y = element_blank())
+
+plot_mavri1 <- plot_mavri + theme(axis.text.x = element_blank(),
+                                  axis.title.y = element_blank(),
+                                axis.title.x = element_blank())
+
+plot_skala1 <- plot_skala + theme(axis.text.x = element_text(size=8),
+                                axis.title.x = element_text(size=8),
+                                axis.title.y = element_blank())
+
+plot_jeita1 <- plot_jeita + theme(axis.text.x = element_text(size=8),
+                                axis.title.x = element_text(size=8),
+                                axis.title.y = element_blank())
+
+plot_sofular1 <- plot_sofular + theme(axis.text.x = element_blank(),
+                                    axis.title.x = element_blank(),
+                                    axis.title.y = element_blank())
+
+plot_kokain1 <- plot_kokain + theme(axis.text.x = element_text(size=8),
+                                    axis.title.y = element_blank(),
+                                    axis.title.x = element_text(size=8))  
+```
+
+
+```{r}
+# Combine the plots for set "one" without x-axis ticks, text, and titles
+panels_levant <- (spd_levant1 / forest_levant1 / plot_sofular1 / plot_jeita1)
+panels_levant
+
+
+# Combine the plots for set "one" without x-axis ticks, text, and titles
+panels_anatolia <- (spd_anatolia1 / forest_anatolia1 / plot_sofular1 / plot_kokain1)
+panels_anatolia
+
+# Combine the plots for set "one" without x-axis ticks, text, and titles
+panels_greece <- (spd_greece1 / forest_greece1 / plot_mavri1 / plot_skala1)
+panels_greece
+```
+
+
+
+```{r}
+combined_plot <- panels_greece | panels_anatolia | panels_levant
+
+# Display the combined plot
+combined_plot
+```
+
+```{r}
+ggsave(plot = combined_plot,filename = "Output/Figure_8.pdf", units = "cm", width = 18.5, height = 12)
+```
+
+
+
+```{r}
+speleo_points <- Raw_Data |>
+  filter(site_name%in%c("Jeita-1", "Skala Marion cave","Sofular cave","Mavri Trypa cave","Soreq cave","Kocain"))  |>
+  select(site_name,latitude,longitude) |>
+  distinct()
+```
+
+
+```{r}
+plot_data <- ggplot() +
+  geom_sf(data=land_polyg, fill="#e8e8e8", color="#A6A6A6",lwd=0.2, alpha=1) +
+  geom_point(data=filter(radiocarbones0, region %in% c("Anatolia", "Greece", "Levant")), aes(x=Long, y=Lat, colour=region),size=0.03) +
+  geom_point(data=filter(pollen, region %in% c("Anatolia", "Greece", "Levant")), aes(x=longitude, y=latitude, fill=region), shape=21, size=1.5,stroke=0.5) +
+  geom_point(data=speleo_points, aes(x=longitude, y=latitude), size=1.5, shape=2,stroke=0.6) +
+  ggrepel::geom_text_repel(data=speleo_points, aes(x=longitude, y=latitude, label=site_name),size=3) +
+  scale_color_manual(values = c("Levant" = "#F1C232", "Anatolia" = "#6A1CB0", "Greece" = "#0fa25c")) +
+  scale_fill_manual(values = c("Levant" = "#F1C232", "Anatolia" = "#6A1CB0", "Greece" = "#0fa25c")) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(
+    color = "Radiocarbon",  # Change the color legend title
+    fill = "Pollen" ) +   # Change the fill legend title
+  ggspatial::annotation_scale(location = "bl", 
+                                    plot_unit ="km", 
+                                    height = unit(0.13, "cm"), 
+                                    text_cex = 0.45, 
+                                    text_pad = unit(0.05, "cm"), 
+                                    width_hint = 0.1, 
+                                    pad_x =  unit(0.1, "cm"), 
+                                    pad_y = unit(0.1, "cm")) +
+  annotate(geom = "text", x = 27, y = 33.8, label = "Mediterranean Sea", 
+    fontface = "italic", color = "gray25", size = 2.3) +
+  theme(
+    legend.position = c(0.95, 0.05),  # Adjust these values to position the legend
+    legend.justification = c(1, 0),   # Adjust these values for justification
+    legend.box.background = element_rect(fill="transparent",colour="transparent"),
+    legend.background = element_rect(fill = alpha("white", alpha = 0.6), color = "#A6A6A6", size = 0.1),
+    legend.title = element_text(size = 8,hjust = 0.5),
+    legend.text = element_text(size = 8),
+    legend.key.size = unit(0.35, "lines"), # Adjust the key (squares within the legend) size as needed
+    legend.margin = margin(0.6, 0.6, 0.6, 0.6), # Margin between text and border
+    panel.background = element_rect(fill="transparent",colour="transparent",size = 0.1),
+    panel.border = element_rect(fill="transparent",colour="black"),
+    axis.title = element_blank(),
+   axis.text = element_text(size=8))
+
+plot_data
+```
+
+
+
+```{r}
+ggsave(plot = plot_data, filename = "Ouput_figures/mapa_data_figure8.pdf", units = "cm", height = 8,width = 10)
+```
+
+
+
+

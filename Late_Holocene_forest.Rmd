@@ -1,0 +1,504 @@
+---
+title: "TEDE_extent_August2022"
+output: html_document
+date: "2022-08-24"
+---
+
+```{r}
+# Install the required package (if not already installed)
+# remotes::install_github("people3k/p3k14c@2022.06")
+library(sf)
+library(tidyverse)
+library(doParallel)
+library(rcarbon)
+library(p3k14c)
+```
+
+
+Theme for the plots
+```{r}
+my_theme <- theme(
+  panel.border = element_rect(fill="transparent",colour="black"),
+  panel.background = element_rect(fill="transparent",colour="transparent"),
+  axis.text.y = element_text(size=8),
+  axis.title.y = element_text(size=8)
+)
+```
+
+
+## ---------------------------- SPD curve
+
+
+
+```{r}
+# Load the radiocarbon data and filter
+radiocarbones <- p3k14c_data %>%
+  filter(Age <= 8500) %>%
+  mutate(
+    region = case_when(
+      between(Long, 20, 40) & between(Lat, 36, 41.4) |
+      between(Long, 30, 40) & between(Lat, 30, 34.5) |
+      between(Long, 35, 40) & between(Lat, 34.5, 36) ~ "medba",
+      TRUE ~ "other"
+    )
+  ) %>%
+  filter(region != "other")
+
+# Create a scatter plot
+scatter_plot <- ggplot(radiocarbones, aes(x = Long, y = Lat)) +
+  geom_point()
+
+# General SPD parameters
+nsim <- 1000 #Set 5 for testing 
+ncores <- 6
+runm <- 50
+binh <- 50
+realstartBP <- 10000
+realendBP <- 2000
+bracket <- 1000
+workingstartBP <- realstartBP + bracket
+workingendBP <- max(0, realendBP - bracket)
+
+# Calibrate the radiocarbon dates
+alldates_my1 <- calibrate(
+  x = radiocarbones$Age,
+  errors = radiocarbones$Error,
+  calCurves = 'intcal20',
+  method = "standard",
+  normalised = FALSE,
+  ncores = ncores,
+  calMatrix = TRUE
+)
+
+# Prepare bins
+bins_my1 <- binPrep(
+  sites = radiocarbones$SiteName,
+  ages = radiocarbones$Age,
+  h = binh
+)
+
+# Calculate SPD
+allspd_my1 <- spd(
+  x = alldates_my1,
+  bins = bins_my1,
+  timeRange = c(workingstartBP, workingendBP),
+  datenormalised = FALSE,
+  runm = runm
+)
+
+# Fit a logistic model and create a predicted SPD
+spd.smoothed <- spd(
+  alldates_my1,
+  timeRange = c(6900, 2000),
+  bins = bins_my1,
+  runm = runm
+)
+
+logFit <- nls(
+  PrDens ~ SSlogis(calBP, Asym, xmid, scale),
+  data = spd.smoothed$grid,
+  control = nls.control(maxiter = 500),
+  start = list(Asym = 0.1, xmid = 4000, scale = -100)
+)
+
+logFitDens <- data.frame(
+  calBP = spd.smoothed$grid$calBP,
+  PrDens = SSlogis(
+    input = spd.smoothed$grid$calBP,
+    Asym = coefficients(logFit)[1],
+    xmid = coefficients(logFit)[2],
+    scal = coefficients(logFit)[3]
+  )
+)
+
+logisticmod <- modelTest(
+  alldates_my1,
+  errors = radiocarbones$Error,
+  bins = bins_my1,
+  nsim = nsim,
+  timeRange = c(6800, 2000),
+  model = "custom",
+  predgrid = logFitDens,
+  runm = runm,
+  raw = TRUE
+)
+
+# Extract the relevant data from logisticmod
+logistic_data <- logisticmod$result %>%
+  as.data.frame()
+
+# Create the plot
+plot_med <- logistic_data %>%
+  filter(calBP >= 2500 & calBP <= 6000) %>%
+  ggplot() +
+  geom_ribbon(aes(x = calBP, ymin = lo, ymax = hi), fill = "grey70") +
+  geom_line(aes(x = calBP, y = PrDens),colour="#fa3c4c") +
+  expand_limits(x = c(0, 6000)) +
+  scale_x_continuous(breaks = seq(0, 6000, 500), expand = c(0, 0),labels = seq(0,6,0.5)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  annotate("text", x = 60, y = 0.45, label = "(b) SPD", size = 2, hjust=0) +
+  labs(x="Age (ky)", y= NULL) +
+  my_theme
+
+plot_med
+```
+
+
+## --------------------- VEGETATION 
+
+```{r}
+pollen <- read.csv("Input/Pollen_data.csv") %>% filter(!marine_or_velgbasin %in% c("marine", "velg"))
+
+cutpoints <- read.csv("Input/Cutpoints_optimal_umbrales.csv") %>% select(biome, threshold) %>% distinct()
+
+observed_biome <- read.csv("Input/resolution1kmfrom250m_window21km_perside.csv") %>% select(ID_SAMPLE, Dominant, Subdominant)
+
+train <- read.csv("Input/BiomeData_EC4c_f.csv", header = TRUE, sep = ",")
+
+
+
+# Extract common columns for pollen_sampmeta and polenpred
+common_cols <- c("entity_name", "latitude", "longitude", "elevation", "ID_SAMPLE", "age")
+
+# Select the region of interest
+pollen <- pollen %>%
+  mutate(
+    region = case_when(
+      (longitude >= 20 & longitude <= 40 & latitude >= 36 & latitude <= 41.5) |
+      (longitude >= 30 & longitude <= 40 & latitude >= 30 & latitude <= 34.5) ~ "medba",
+      TRUE ~ "other"
+    )
+  ) %>%
+  filter(region != "other")
+
+# Create pollen_sampmeta and polen_summary in one step
+pollen_sampmeta <- pollen %>%
+  select(region, common_cols) %>%
+  distinct()
+
+# Create a table AllData
+alldata <- pollen %>%
+  full_join(train, by = "taxon_name") %>%
+  filter(!is.na(ID_SAMPLE), !is.na(Mean_CENF))
+
+# Dissimilarity index
+biomes0 <- alldata %>%
+  mutate(Epsilon = 0.5) %>%
+  mutate(
+    TUND_Sqrt = (taxon_percent - Mean_TUND)^2 / ((Stdev_TUND + Epsilon)^2),
+    DESE_Sqrt = (taxon_percent - Mean_DESE)^2 / ((Stdev_DESE + Epsilon)^2),
+    GRAM_Sqrt = (taxon_percent - Mean_GRAM)^2 / ((Stdev_GRAM + Epsilon)^2),
+    XSHB_Sqrt = (taxon_percent - Mean_XSHB)^2 / ((Stdev_XSHB + Epsilon)^2),
+    CENF_Sqrt = (taxon_percent - Mean_CENF)^2 / ((Stdev_CENF + Epsilon)^2),
+    TEDE_Sqrt = (taxon_percent - Mean_TEDE)^2 / ((Stdev_TEDE + Epsilon)^2),
+    CMIX_Sqrt = (taxon_percent - Mean_CMIX)^2 / ((Stdev_CMIX + Epsilon)^2),
+    ENWD_Sqrt = (taxon_percent - Mean_ENWD)^2 / ((Stdev_ENWD + Epsilon)^2),
+    WTSFS_Sqrt = (taxon_percent - Mean_WTSFS)^2 / ((Stdev_WTSFS + Epsilon)^2)
+  ) %>%
+  select(ID_SAMPLE, ends_with("_Sqrt")) %>%
+  group_by(ID_SAMPLE) %>%
+  summarise(across(ends_with("_Sqrt"), sum)) %>%
+  mutate(across(ends_with("_Sqrt"), sqrt)) %>%
+  ungroup()
+
+
+# Get reciprocal of the scores and perform normalization
+biomes <- biomes0 %>%
+  mutate(across(ends_with("_Sqrt"), ~ exp(-. / 100))) %>%
+  select(ID_SAMPLE, starts_with("TUND"), starts_with("DESE"), starts_with("GRAM"),
+         starts_with("XSHB"), starts_with("CENF"), starts_with("TEDE"),
+         starts_with("CMIX"), starts_with("ENWD"), starts_with("WTSFS"))
+
+
+# Pollen prediction
+polenpred <- biomes %>%
+  pivot_longer(cols = ends_with("_Sqrt"), names_to = "pred_biome", values_to = "pred_score") %>%
+  mutate(pred_biome = str_remove(pred_biome, "_Sqrt")) %>%
+  group_by(ID_SAMPLE) %>%
+  arrange(ID_SAMPLE, desc(pred_score)) %>%
+  slice_max(pred_score, n = 1) %>%
+  ungroup() %>%
+  inner_join(cutpoints, by = c("pred_biome" = "biome")) %>%
+  mutate(pred_biome_noa = ifelse(pred_score <= threshold, "NONA", pred_biome)) %>%
+  inner_join(pollen_sampmeta, by = "ID_SAMPLE") %>%
+  mutate(
+    pred_biome_noa_arbol = case_when(
+      pred_biome_noa %in% c("TEDE", "CMIX", "CENF") ~ "FOREST",
+      pred_biome_noa == "WTSFS" ~ "WTFS",
+      pred_biome_noa %in% c("GRAM", "DESE", "XSHB", "ENWD", "TUND") ~ "OTHER",
+      TRUE ~ pred_biome_noa
+    ),
+    pred_biome_noa_arbol_two = case_when(
+      pred_biome_noa %in% c("TEDE", "CMIX") ~ "FOREST",
+      pred_biome_noa %in% c("GRAM", "DESE", "XSHB", "ENWD", "TUND", "WTSFS") ~ "OPEN",
+      TRUE ~ pred_biome_noa
+    )
+  )
+
+
+
+# Calculate resolution of sequences
+resolucion <- polenpred %>%
+  group_by(entity_name) %>%
+  mutate(
+    anterior = lag(age),
+    reso = age - anterior,
+    resolucion = mean(reso, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  summarise(mean_resol = mean(resolucion, na.rm = TRUE))
+
+res_f <- round(unique(resolucion$mean_resol) / 50) * 50
+res_f <- 300
+res_f_half <- res_f / 2
+
+
+# Create bincentre column using mutate() and bind_rows()
+wind_polenpred_arbol <- seq(res_f, 6000, res_f_half) %>%
+  map_dfr(~ polenpred %>%
+             filter(age >= (.x - res_f) & age <= .x) %>%
+             mutate(ventana = paste("v", .x - res_f, ".", .x, sep = ""), bincentre = .x - res_f_half))
+
+
+
+# Plot all entities
+polen_wind_arbol <- wind_polenpred_arbol %>%
+  group_by(entity_name, bincentre, pred_biome_noa_arbol) %>%
+  mutate(sumbiomescores = sum(pred_score)) %>%
+  ungroup() %>%
+  group_by(entity_name, bincentre) %>%
+  slice_max(sumbiomescores, with_ties = FALSE) %>%
+  ungroup() %>%
+  group_by(region, bincentre) %>%
+  add_count(name = "ent_per_bincentre") %>%
+  ungroup() %>%
+  group_by(region, bincentre, pred_biome_noa_arbol) %>%
+  add_count(name = "biom_sites") %>%
+  ungroup() %>%
+  mutate(propbiom = (biom_sites / ent_per_bincentre) * 100) %>%
+  select(region, bincentre, pred_biome_noa_arbol, ent_per_bincentre, biom_sites, propbiom) %>%
+  distinct()
+
+# Plot all entities
+polen_wind_arbol_two <- wind_polenpred_arbol %>%
+  group_by(entity_name, bincentre, pred_biome_noa_arbol_two) %>%
+  mutate(sumbiomescores = sum(pred_score)) %>%
+  ungroup() %>%
+  group_by(entity_name, bincentre) %>%
+  slice_max(sumbiomescores, with_ties = FALSE) %>%
+  ungroup() %>%
+  group_by(region, bincentre) %>%
+  add_count(name = "ent_per_bincentre") %>%
+  ungroup() %>%
+  group_by(region, bincentre, pred_biome_noa_arbol_two) %>%
+  add_count(name = "biom_sites") %>%
+  ungroup() %>%
+  mutate(propbiom = (biom_sites / ent_per_bincentre) * 100) %>%
+  select(region, bincentre, pred_biome_noa_arbol_two, ent_per_bincentre, biom_sites, propbiom) %>%
+  distinct()
+
+# Calculate confidence bands for set "one"
+confidence_bands <- polen_wind_arbol %>%
+  group_by(pred_biome_noa_arbol) %>%
+  summarise(
+    group_se = (sd(propbiom) / sqrt(n())) * 1.96
+  )
+
+# Calculate confidence bands for set "two"
+confidence_bands_two <- polen_wind_arbol_two %>%
+  group_by(pred_biome_noa_arbol_two) %>%
+  summarise(
+    group_se = (sd(propbiom) / sqrt(n())) * 1.96
+  )
+
+# Create step plots
+create_step_plot <- function(data, se, title) {
+  step_plot <- data %>%
+    ggplot() +
+    pammtools::geom_stepribbon(aes(x = bincentre, ymin = propbiom - se, ymax = propbiom + se), fill = "grey70") +
+    geom_step(aes(x = bincentre, y = propbiom), size = 0.5) +
+    expand_limits(x = c(0, 6000)) +
+    scale_x_continuous(breaks = seq(0, 6000, 500), expand = c(0, 0),labels = seq(0,6,0.5)) +
+    scale_y_continuous(expand = c(0, 0)) +
+    annotate("text", x = 60, y = 59, label = title, size = 2, hjust=0) +
+    labs(x="Age (ky)") +
+    my_theme 
+  
+  return(step_plot)
+}
+
+# Create step plots for set "one"
+step_plot_arbol <- create_step_plot(filter(polen_wind_arbol,pred_biome_noa_arbol=="FOREST"), pull(select(filter(confidence_bands,pred_biome_noa_arbol == "FOREST"),group_se)), "(c) Forest")
+
+step_plot_noarbol <- create_step_plot(filter(polen_wind_arbol,pred_biome_noa_arbol=="OTHER"), 
+                                      pull(select(filter(confidence_bands,pred_biome_noa_arbol == "OTHER"),group_se)), "Other")
+
+step_plot_wtfs <- create_step_plot(filter(polen_wind_arbol, pred_biome_noa_arbol=="WTFS"),
+                                   pull(select(filter(confidence_bands,pred_biome_noa_arbol == "WTFS"),group_se)), "WTFS")
+
+# Create step plots for set "two"
+step_plot_arbol_two <- create_step_plot(filter(polen_wind_arbol_two,pred_biome_noa_arbol_two=="FOREST"),
+                                        pull(select(filter(confidence_bands_two,pred_biome_noa_arbol_two == "FOREST"),group_se)), "Forest (Two)")
+
+step_plot_open_two <- create_step_plot(filter(polen_wind_arbol_two,pred_biome_noa_arbol_two=="OPEN"), 
+                                       pull(select(filter(confidence_bands_two,pred_biome_noa_arbol_two == "OPEN"),group_se)), "Open (Two)")
+
+# Combine the plots for set "one"
+combined_plot <- (step_plot_arbol / step_plot_noarbol / step_plot_wtfs)
+
+# Combine the plots for set "two"
+combined_plot_two <- (step_plot_arbol_two / step_plot_open_two)
+
+# Save or display the combined plots
+print(combined_plot)
+print(combined_plot_two)
+```
+
+
+
+## ---------------- SPELEOTHEMES 
+
+```{r}
+kokain <- read.csv("Input/lake_isotopes/kocain2021iso.csv") %>%
+  mutate(
+    entity_name = "Kocain",
+    site_name = "Kocain",
+    site_id = 1000,
+    age = 1950 - age_AD,
+    latitude = 37.2325,
+    longitude = 30.71167,
+    sample_id = row_number()
+  ) %>%
+  rename(d18O_measurement = d18O) %>%
+  select(-c(age_AD, depth_mm, d13C))
+
+DBI::dbConnect(RMySQL::MySQL(),user = "root", 
+                 password='11.Opuntia', 
+                 host='localhost',
+                 dbname='sisal_v2')->sisal
+
+sisal |>
+DBI::dbGetQuery("SELECT site_id, site_name, latitude, longitude, entity_name, entity_id, sample_id, depth_sample, Bchron_age, interp_age, d18O_measurement, d13C_measurement
+FROM site JOIN entity USING (site_id) JOIN sample USING (entity_id) 
+JOIN sisal_chronology USING (sample_id) JOIN original_chronology USING(sample_id) JOIN d18o USING (sample_id) JOIN d13c USING (sample_id)  WHERE (latitude BETWEEN 30 AND 42.5) AND (longitude BETWEEN 20 AND 45);") |>
+  mutate(age=case_when(is.na(Bchron_age) ~ interp_age, TRUE ~ Bchron_age)) |>
+ # mutate(age=coalesce(age,interp_age)) |>
+ # filter(!is.na(age)) |>
+  filter(age <= 6000) |>
+  select(-c("Bchron_age", "interp_age")) -> data1
+
+
+sisal |>
+DBI::dbGetQuery("SELECT site_id, site_name, latitude, longitude, entity_name, entity_id, sample_id, depth_sample, interp_age, d18O_measurement, d13C_measurement
+FROM site JOIN entity USING (site_id) JOIN sample USING (entity_id) JOIN original_chronology USING(sample_id) JOIN d18o USING (sample_id) JOIN d13c USING (sample_id) WHERE entity_id in (690);") |>
+  mutate(age=interp_age) |>
+ # mutate(age=coalesce(age,interp_age)) |>
+ # filter(!is.na(age)) |>
+  filter(age <= 6000) |>
+  select(-c("interp_age")) -> soreq
+
+bind_rows(data1,soreq,kokain) -> Raw_Data
+
+#DBI::dbDisconnect(sisal)
+#rm(sisal)
+
+Raw_Data <- Raw_Data |>
+  mutate(d18O_measurement = case_when(site_name=="Sofular cave" ~ d13C_measurement,TRUE ~ d18O_measurement),
+         site_name = case_when(entity_name=="Jeita-1" ~ "Jeita-1", TRUE ~ site_name))
+
+plot_speleo <- function(data, y_col, y_label) {
+  data %>%
+    filter(site_name == site_name_value) %>%
+    ggplot(aes(x = age, y = {{y_col}})) +
+    geom_step(colour = "#0084ff") +
+    labs(x = NULL, y = y_label) +
+    annotate("text", x = 60, y = y_text, label = label, size = 2, hjust = 0) +
+    expand_limits(x = c(0, 6000)) +
+    scale_x_continuous(breaks = seq(0, 6000, 500), expand = c(0, 0),labels = seq(0,6,0.5)) +
+    scale_y_continuous(expand = c(0,0))+
+    scale_y_reverse(position = posit)+
+    labs(x="Age (ky)") +
+    my_theme 
+}
+
+
+site_name_value <- "Jeita-1"
+label <- "(f) Jeita"
+y_text <- -5.9
+posit <- "right"
+plot_jeita <- plot_speleo(Raw_Data, d18O_measurement, expression(delta^18*O~"(‰VPDB)"))
+
+site_name_value <- "Sofular cave"
+label <- "(g) Sofular"
+y_text <- -11.4
+posit <- "left"
+plot_sofular <- plot_speleo(Raw_Data, d13C_measurement, expression(delta^13*C~"(‰VPDB)"))
+
+site_name_value <- "Skala Marion cave"
+label <- "(e) Skala Marion"
+y_text <- -6.6
+posit <- "left"
+plot_skala <- plot_speleo(Raw_Data, d18O_measurement, expression(delta^18*O~"(‰VPDB)"))
+
+site_name_value <- "Mavri Trypa cave"
+label <- "(d) Mavri Trypa"
+y_text <- -6
+posit <- "right"
+plot_mavri <- plot_speleo(Raw_Data, d18O_measurement, expression(delta^18*O~"(‰VPDB)"))
+
+site_name_value <- "Kocain"
+label <- "(h) Kocain"
+y_text <- -4.3
+posit <- "right"
+plot_kokain <- plot_speleo(Raw_Data, d18O_measurement, expression(delta^18*O~"(‰VPDB)"))
+
+plot_jeita
+plot_sofular
+plot_skala
+plot_mavri
+plot_kokain
+```
+
+
+
+```{r}
+plot_med <- plot_med + theme(axis.text = element_blank(),
+                            axis.ticks = element_blank(),
+                            axis.title.x = element_blank())
+
+step_plot_arbol <- step_plot_arbol + theme(axis.text.x = element_blank(),
+                                          axis.ticks.x = element_blank(),
+                                          axis.title.x = element_blank())
+
+plot_mavri <- plot_mavri + theme(axis.text.x = element_blank(),
+                                axis.ticks.x = element_blank(),
+                                axis.title.x = element_blank())
+
+plot_skala <- plot_skala + theme(axis.text.x = element_blank(),
+                                axis.ticks.x = element_blank(),
+                                axis.title.x = element_blank())
+
+plot_jeita <- plot_jeita + theme(axis.text.x = element_blank(),
+                                axis.ticks.x = element_blank(),
+                                axis.title.x = element_blank())
+
+plot_sofular <- plot_sofular + theme(axis.text.x = element_blank(),
+                                    axis.ticks.x = element_blank(),
+                                    axis.title.x = element_blank())
+
+plot_kokain <- plot_kokain + theme(axis.text.x = element_text(size=8),
+                                    axis.title.x = element_text(size=8))  # Keep x-axis ticks, text, and title for the bottom plot
+
+# Combine the plots for set "one" without x-axis ticks, text, and titles
+panels_plot <- (plot_med / step_plot_arbol / plot_mavri / plot_skala / plot_jeita / plot_sofular / plot_kokain)
+
+# Print the combined plot
+panels_plot
+```
+
+
+
+```{r}
+ggsave(panels_plot, filename = "Output/Figure_7.pdf", units = "cm", width = 8, height = 16)
+```
+

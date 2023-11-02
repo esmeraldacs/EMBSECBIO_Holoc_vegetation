@@ -5,6 +5,10 @@
 This is the code related to the paper:
 # **Holocene vegetation dynamics of the Eastern Mediterranean region: Old controversies addressed by a new analysis**
 
+Esmeralda Cruz-Silva, Sandy P. Harrison, I. Colin Prentice, Elena Marinova
+
+Link to the paper: https://onlinelibrary.wiley.com/doi/full/10.1111/jbi.14749 
+
 ## **Abstract**
 **Aim**
 We reconstruct vegetation changes since 12 ky in the Eastern Mediterranean to examine four features of the regional vegetation history that are controversial: the extent of non-analogue vegetation assemblages in the transition from the Late Glacial to the early Holocene, the synchroneity of postglacial forest expansion, the geographical extent of temperate deciduous forest during the mid-Holocene and the timing and trigger for the re-establishment of drought-tolerant vegetation during the late Holocene.

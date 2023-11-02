@@ -1,0 +1,275 @@
+---
+title: "Nuevo"
+output: html_document
+date: "2023-10-30"
+---
+
+```{r}
+library(tidyverse)
+library(patchwork)
+```
+
+
+Theme for the plots
+```{r}
+my_theme <- theme(
+  panel.border = element_rect(fill="transparent",colour="black",size=0.3),
+  panel.background = element_rect(fill="transparent",colour="transparent"),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  axis.text.y = element_text(size=8),
+  axis.title.y = element_text(size=8),
+  plot.title = element_text(size=8, vjust=-1),
+  plot.subtitle = element_text(size=8,vjust=-1)
+  )
+```
+
+
+```{r}
+train <- read.csv("Input/BiomeData_EC4c_f.csv",header=TRUE,sep=",")
+
+cutpoints <- read.csv("Input/Cutpoints_optimal_umbrales.csv") |>  
+  dplyr::select(biome,threshold) |> 
+  dplyr::distinct()
+
+pollen <- read.csv("Input/Pollen_data.csv") |>
+  filter(!marine_or_velgbasin %in% c("marine","velg"))
+
+pollen_metadat <- pollen |>
+  select(entity_name,ID_SAMPLE,age,avg_depth,latitude,longitude) |>
+  distinct()
+
+# Create a table AllData
+alldata <- pollen %>% full_join(train, by = "taxon_name") %>% filter(!is.na(ID_SAMPLE) & !is.na(Mean_CENF))
+```
+
+
+
+```{r}
+# Dissimilarity index
+biomes0 <- alldata %>%
+  mutate(Epsilon = 0.5) %>%
+  mutate(
+    TUND_Sqrt = (taxon_percent - Mean_TUND)^2 / ((Stdev_TUND + Epsilon)^2),
+    DESE_Sqrt = (taxon_percent - Mean_DESE)^2 / ((Stdev_DESE + Epsilon)^2),
+    GRAM_Sqrt = (taxon_percent - Mean_GRAM)^2 / ((Stdev_GRAM + Epsilon)^2),
+    XSHB_Sqrt = (taxon_percent - Mean_XSHB)^2 / ((Stdev_XSHB + Epsilon)^2),
+    CENF_Sqrt = (taxon_percent - Mean_CENF)^2 / ((Stdev_CENF + Epsilon)^2),
+    TEDE_Sqrt = (taxon_percent - Mean_TEDE)^2 / ((Stdev_TEDE + Epsilon)^2),
+    CMIX_Sqrt = (taxon_percent - Mean_CMIX)^2 / ((Stdev_CMIX + Epsilon)^2),
+    ENWD_Sqrt = (taxon_percent - Mean_ENWD)^2 / ((Stdev_ENWD + Epsilon)^2),
+    WTSFS_Sqrt = (taxon_percent - Mean_WTSFS)^2 / ((Stdev_WTSFS + Epsilon)^2)
+  ) %>%
+  select(ID_SAMPLE, ends_with("_Sqrt")) %>%
+  group_by(ID_SAMPLE) %>%
+  summarise(across(ends_with("_Sqrt"), sum)) %>%
+  mutate(across(ends_with("_Sqrt"), sqrt)) %>%
+  ungroup()
+
+
+# Get reciprocal of the scores and perform normalization
+biomes <- biomes0 %>%
+  mutate(
+    across(
+      ends_with("_Sqrt"), ~ exp(-. / 100)
+      )
+    ) |>
+  rename_with(~str_remove(., "_Sqrt"), ends_with("_Sqrt")) 
+```
+
+
+```{r}
+polenpred <- biomes |>
+  tidyr::pivot_longer(cols = TUND:WTSFS, names_to = "pred_biome", values_to = "pred_score") |>
+  group_by(ID_SAMPLE) |>
+  arrange(ID_SAMPLE,desc(pred_score)) |>
+  slice_max(pred_score, n=1) |>
+  ungroup() |>
+  inner_join(cutpoints, by =  c("pred_biome" = "biome")) |> 
+  mutate(
+    pred_biome_noa = case_when(
+      pred_score <= threshold ~ "NONA", TRUE ~ pred_biome
+      )
+    ) |> 
+  inner_join(pollen_metadat, by = "ID_SAMPLE")|>
+  dplyr::select(entity_name,latitude,longitude,ID_SAMPLE,age,everything())
+```
+
+
+```{r}
+polenpredelev <- polenpred |>
+  dplyr::select(longitude,latitude) %>% distinct() |>
+  rename(x=latitude,y=longitude) |>
+  sp::SpatialPoints(proj4string = sp::CRS("+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0 +units=m +no_defs")) %>%
+  sf::st_as_sf(coords = c("longitude", "latitude"),
+        crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0 +units=m +no_defs") %>% 
+  elevatr::get_elev_point(prj = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0 +units=m +no_defs", src = "aws") |>
+  sf::st_as_sf(coords = c("longitude", "latitude"),
+        crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0 +units=m +no_defs") %>% 
+  cbind(., sf::st_coordinates(.)) |>
+  as_tibble() |>
+  dplyr::select(elevation,X,Y) |>
+  rename(longitude=X, latitude=Y) |>
+  full_join(polenpred, by = c("longitude", "latitude")) |>
+  dplyr::distinct()
+```
+
+
+```{r}
+res_f <- 300
+res_f_half <- 150
+
+wind <- seq(res_f, 13200, res_f_half) %>%
+  map_dfr(~ polenpredelev %>%
+             filter(age >= (.x - res_f) & age <= .x) %>%
+             mutate(ventana = paste("v", .x - res_f, ".", .x, sep = ""), bincentre = .x - res_f_half) %>%
+             mutate(ent_ventana = paste(ventana, entity_name, sep = "-")))
+
+timeser <- wind |>
+  group_by(ent_ventana,pred_biome_noa) |>
+  mutate(sumbiomescores=sum(pred_score)) |>
+  ungroup() |>
+  group_by(ent_ventana) |>
+  slice_max(sumbiomescores, with_ties = FALSE) |>
+  ungroup() |>
+  group_by(bincentre) |>
+  add_count(name = "ent_perwind") |>
+  ungroup() |>
+  group_by(bincentre,pred_biome_noa)|>
+  add_count(name="biom_sites") |>
+  ungroup() |>
+  mutate(propbiom=(biom_sites/ent_perwind)*100) |>
+  dplyr::select(bincentre,pred_biome_noa,ventana,ent_perwind,biom_sites,propbiom) |>
+  distinct() |>
+  filter(pred_biome_noa%in%c("NONA"))
+
+polen_wind3 <- wind |>
+  dplyr::select(bincentre,entity_name,ent_ventana) |>
+  distinct() |>
+  group_by(bincentre) |>
+  add_tally(name = "entities_per_bin") |>
+  ungroup() |>
+  dplyr::select(bincentre,entities_per_bin) |>
+  distinct() |>
+  filter(entities_per_bin < 500) #Remove the modern window
+```
+
+
+
+```{r}
+plot_nona <- timeser |>
+  ggplot(aes(x=bincentre, y=propbiom)) +
+  geom_rect(aes(xmin = 9500, xmax = 11500, ymin = -Inf, ymax = Inf), fill = "#0084FF", alpha = 0.01) +
+  geom_step(size=0.3) +
+  geom_hline(yintercept=5, color="#FF0000", size=0.3) +
+  geom_vline(xintercept = c(11500,9500), size=0.3,linetype="dotted")+
+  expand_limits(x=c(0,12300)) +
+  scale_x_continuous(breaks = seq(0,12300,by=2000),labels = seq(0,12,2) ,expand = c(0,0)) +
+  scale_y_continuous(breaks = seq(0,30,by=10)) +
+  labs(x="Age (ky)", y="Non-analog records (%)") +
+  my_theme
+
+plot_reco <- polen_wind3 |>
+  filter(bincentre <= 12300) |>
+  ggplot(aes(x=bincentre,y=entities_per_bin))+
+  geom_rect(aes(xmin = 9500, xmax = 11500, ymin = -Inf, ymax = Inf), fill = "#0084FF", alpha = 0.01) +
+  geom_bar(stat="identity", fill="#e3e3e3",colour="#e3e3e3") +
+  geom_text(aes(x = 280, y = 81, label = "(a)"), size = 3.25, fontface = "bold") +
+  expand_limits(x=c(0,12300)) +
+  scale_x_continuous(breaks = seq(0,12300,by=2000),labels = seq(0,12,2) ,expand = c(0,0)) +
+  scale_y_continuous(breaks = seq(0,80,20),expand = c(0,1.3),position = "right") +
+  labs(x="Age (ky)", y="Number of records") +
+  my_theme
+
+plot_nona
+plot_reco
+```
+
+
+```{r}
+plot_reco <- plot_reco + theme(axis.text.x = element_blank(),
+                               axis.title.x = element_blank())
+
+plot_nona <- plot_nona + theme(axis.text.x = element_text(size=8),
+                               axis.title.x = element_text(size=8)) 
+
+panels_plot <- (plot_reco / plot_nona)
+
+# Print the combined plot
+panels_plot
+```
+
+
+```{r}
+peak_nona_gray_dots <- polenpredelev |>
+  filter(age >= 9500, age <= 11500)
+
+peak_nona_dots <- polenpredelev |>
+  filter(age >= 9500, age <= 11500) |>
+  group_by(entity_name) |>
+  add_tally(name = "samples_per_enti") |>
+  ungroup() |>
+  group_by(entity_name,pred_biome_noa) |>
+  add_tally(name = "samp_per_pred_biome") |>
+  ungroup() |>
+  mutate(percent_per_biome = (samp_per_pred_biome/samples_per_enti)*100) |>
+  filter(pred_biome_noa=="NONA") |>
+  filter(percent_per_biome > 5)
+```
+
+
+```{r}
+land_polyg <- sf::st_read("Raster/modern_eval_land_polyg.shp")
+
+plot_map <- ggplot() +
+  geom_sf(data = land_polyg,fill="#e3e3e3", color="#A6A6A6",lwd=0.2, alpha=1) +
+  scale_x_continuous(expand = c(0,0))+
+  scale_y_continuous(expand = c(0,0))+
+  geom_point(data=peak_nona_gray_dots,aes(x=longitude,y=latitude,size=elevation),shape=21,stroke=0.08,linetype="dotted",fill="gray30") +
+  geom_point(data=peak_nona_dots,aes(x=longitude,y=latitude,size=elevation),shape=21,stroke=0.08,linetype="dotted",fill="#fa3c4c") +
+  geom_text(aes(x = 58, y = 48.5, label = "(b)"), size = 3.25, fontface = "bold") +
+  scale_size_continuous(range=c(0.2,3))+
+  labs(x=NULL,y=NULL, size="elevation\n(m.a.s.l)")+
+  annotate(geom = "text", x = 34.25, y = 43.25, label = "Black Sea", 
+    fontface = "italic", color = "gray25", size = 2.3) +
+  annotate(geom = "text", x = 27, y = 33.8, label = "Mediterranean Sea", 
+    fontface = "italic", color = "gray25", size = 2.3) +
+  my_theme
+  
+plot_map
+```
+
+
+```{r}
+plot_map <- plot_map + theme(axis.text.x = element_text(size=8),
+                             axis.title.x = element_text(size=8),
+                             legend.position = c(0.98, 0.03),  # Adjust these values to position the legend
+    legend.justification = c(1, 0),   # Adjust these values for justification
+    legend.box.background = element_rect(fill="transparent",colour="transparent"),
+    legend.background = element_rect(fill = alpha("white", alpha = 0.6), color = "#A6A6A6", size = 0.1),
+    legend.title = element_text(size = 8,hjust = 0.5),
+    legend.text = element_text(size = 8),
+    legend.key = element_rect(fill = "transparent",color="transparent"),
+    legend.key.size = unit(1.5,"mm"),  # Adjust the key (squares within the legend) size as needed
+    legend.margin = margin(unit = "cm", t=0.08,r=0.08,b=0.08,l=0.08), # Margin between text and border
+    panel.background = element_rect(fill="transparent",colour="transparent",size = 0.1),
+    panel.border = element_rect(fill="transparent",colour="black"),
+    axis.title = element_blank(),
+   axis.text = element_text(size=8)
+   )
+
+plot_map
+```
+
+```{r}
+panels_plot1 <- (plot_map / panels_plot)
+
+# Print the combined plot
+panels_plot1
+```
+
+
+```{r}
+ggsave(plot = panels_plot1, filename = "Output/Figure_3.pdf", units = "cm", height = 20,width = 22)
+```
+
